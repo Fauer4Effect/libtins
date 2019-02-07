@@ -55,10 +55,16 @@ public:
         
     }
     
+    uint16_t trim(uint16_t amount);
+
     const payload_type& payload() const {
         return payload_;
     }
-    
+
+    size_t size() const {
+        return payload_.size();
+    }
+
     uint16_t offset() const {
         return offset_;
     }
@@ -71,10 +77,13 @@ class TINS_API IPv4Stream {
 public:
     IPv4Stream();
     
-    void add_fragment(IP* ip);
+    void add_fragment_first(IP* ip);
+    void add_fragment_last(IP* ip);
+    void add_fragment_linux(IP* ip);
     bool is_complete() const;
     PDU* allocate_pdu() const;
     const IP& first_fragment() const;
+    size_t size() const {return received_size_;}
 private:
     typedef std::vector<IPv4Fragment> fragments_type;
     
@@ -135,7 +144,10 @@ public:
      * technique to be used.
      */
     enum OverlappingTechnique {
-        NONE 
+        NONE,
+        First,
+        Last,
+        Linux
     };
 
     /**

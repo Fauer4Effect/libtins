@@ -37,12 +37,25 @@ using std::make_pair;
 namespace Tins {
 namespace Internals {
 
+uint16_t IPv4Fragment::trim(uint16_t amount) {
+    if (amount > payload_.size()) {
+        amount = payload_.size();
+    }
+    offset_ += amount;
+    payload_.erase(
+        payload_.begin(),
+        payload_.begin() + amount
+    );
+    return amount;
+}
+
 IPv4Stream::IPv4Stream() 
 : received_size_(), total_size_(), received_end_(false) {
 
 }
 
-void IPv4Stream::add_fragment(IP* ip) {
+// First acceptance policy for ip fragment reassembly
+void IPv4Stream::add_fragment_first(IP* ip) {
     const uint16_t offset = extract_offset(ip);
     fragments_type::iterator it = fragments_.begin();
     while (it != fragments_.end() && offset > it->offset()) {
@@ -61,6 +74,134 @@ void IPv4Stream::add_fragment(IP* ip) {
     }
     if (offset == 0) {
         // Release the inner PDU, store this first fragment and restore the inner PDU
+        PDU* inner_pdu = ip->release_inner_pdu();
+        first_fragment_ = *ip;
+        ip->inner_pdu(inner_pdu);
+    }
+}
+
+// Last reassembly policy for ip fragments
+void IPv4Stream::add_fragment_last(IP* ip) {
+    const uint16_t offset = extract_offset(ip);
+    fragments_type::iterator it = fragments_.begin();
+    while (it != fragments_.end() && offset > it->offset()) {
+        ++it;
+    }
+
+    // In order to keep the newest one instead of the oldest one, we will 
+    // 1) remove the old fragment from the size tracker
+    // 2) erase the old fragment from the vector
+    // 3) insert the new fragment
+    // 4) count the new fragment's size
+
+    // Make sure it's a good iterator before delete
+    if (it != fragments_.end()) {
+        received_size_ -= it->size();
+        fragments_.erase(it);
+        // calling erase invalidates existing iterators
+        it = fragments_.begin();
+        while (it != fragments_.end() && offset > it->offset()) {
+            ++it;
+        }
+    }
+    fragments_.insert(it, IPv4Fragment(ip->inner_pdu(), offset));
+    received_size_ += ip->inner_pdu()->size();
+
+    // If the MF flag is off
+    if ((ip->flags() & IP::MORE_FRAGMENTS) == 0) {
+        total_size_ = offset + ip->inner_pdu()->size();
+        received_end_ = true;
+    }
+    if (offset == 0) {
+        PDU* inner_pdu = ip->release_inner_pdu();
+        first_fragment_ = *ip;
+        ip->inner_pdu(inner_pdu);
+    }
+}
+
+// Linux ip fragment reassembly policy. 
+// Prefer lowest offset and then most recent
+void IPv4Stream::add_fragment_linux(IP* ip) {
+    const uint16_t offset = extract_offset(ip);
+    const size_t prev_size = received_size_;
+    uint16_t expected_offset = 0;
+    fragments_type::iterator it = fragments_.begin();
+    while (it != fragments_.end() && offset > it->offset()) {
+        // expected offset is if the new fragment went right after the old one
+        expected_offset = static_cast<uint16_t>(it->offset() + it->size());
+        ++it;
+    }
+
+    // Overlap handling
+    IPv4Fragment frag(ip->inner_pdu(), offset);
+    
+    size_t frag_size = frag.size();
+    // Make sure good iterator
+    if (it != fragments_.end()) {
+        size_t old_frag_size = it->offset() + it->size();
+        // If the new frag completely overlaps the old frag just replace with the last
+        if ((offset == it->offset()) && (frag_size == old_frag_size)) {
+            received_size_ -= it->size();
+            fragments_.erase(it);
+            // calling erase invalidates existing iterators
+            it = fragments_.begin();
+            while (it != fragments_.end() && offset > it->offset()) {
+                ++it;
+            }
+
+            fragments_.insert(it, IPv4Fragment(ip->inner_pdu(), offset));
+            received_size_ += ip->inner_pdu()->size();
+
+            // If the MF flag is off
+            if ((ip->flags() & IP::MORE_FRAGMENTS) == 0) {
+                total_size_ = offset + ip->inner_pdu()->size();
+                received_end_ = true;
+            }
+            if (offset == 0) {
+                PDU* inner_pdu = ip->release_inner_pdu();
+                first_fragment_ = *ip;
+                ip->inner_pdu(inner_pdu);
+            }
+            return;
+        }
+    }
+    
+    // If the new fragment starts in the middle of an old fragment
+    if (expected_offset > offset) {
+        frag.trim(expected_offset - offset);
+    }
+    frag_size = frag.size();
+    // we completely overlapped
+    if (frag_size == 0) {
+        return;
+    }
+    // too big
+    if (static_cast<size_t>(frag.offset()) + frag_size > 65535) {
+        return;
+    }
+    expected_offset = static_cast<uint16_t>(frag.offset() + frag_size);
+    // if we need to trim off stuff from the beginning of the next frag
+    while (it != fragments_.end() && it->offset() < expected_offset) {
+        // adjust the calculated size
+        received_size_ -= it->trim(expected_offset - it->offset());
+        // completely covered old frag
+        if (it->size() == 0) {
+            it = fragments_.erase(it);
+        }
+        else {
+            break;
+        }
+    }
+
+    // finally put in the new frag and check if done
+    fragments_.insert(it, frag);
+    received_size_ += frag_size;
+    
+    if ((ip->flags() & IP::MORE_FRAGMENTS) == 0) {
+        total_size_ = expected_offset;
+        received_end_ = true;
+    }
+    if (frag.offset() == 0) {
         PDU* inner_pdu = ip->release_inner_pdu();
         first_fragment_ = *ip;
         ip->inner_pdu(inner_pdu);
@@ -124,7 +265,24 @@ IPv4Reassembler::PacketStatus IPv4Reassembler::process(PDU& pdu) {
             key_type key = make_key(ip);
             // Create it or look it up, it's the same
             Internals::IPv4Stream& stream = streams_[key];
-            stream.add_fragment(ip);
+            // TODO add way to select which reassembly mode to use
+            // stream.add_fragment_first(ip);
+            switch (technique_)
+            {
+                case First: 
+                    stream.add_fragment_first(ip);
+                    break;
+                case Last: 
+                    stream.add_fragment_last(ip);
+                    break;
+                case Linux: 
+                    stream.add_fragment_linux(ip);
+                    break;
+                // might as well set the default to the original policy
+                default: 
+                    stream.add_fragment_first(ip);
+                    break;
+            }
             if (stream.is_complete()) {
                 PDU* pdu = stream.allocate_pdu();
                 // Use all field values from the first fragment
